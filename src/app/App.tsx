@@ -1,12 +1,13 @@
 import { useState, useRef, useMemo } from 'react';
 import { Icon } from './components/Icon';
 import { ImageWithFallback } from './components/figma/ImageWithFallback';
+const dexMatchLogo = '';
 import {
   JOBS,
   COMPANIES,
   JOB_TYPES,
   EXTRACTED_SKILLS,
-  TOTAL_OPENINGS,
+  DISPLAY_OPENINGS,
   UNIQUE_REGIONS,
   UNIQUE_COMPANIES,
   Job,
@@ -17,6 +18,16 @@ type Phase = 'idle' | 'uploaded' | 'analyzing' | 'done';
 type View = 'landing' | 'browse' | 'companies';
 
 const ANALYSIS_STEPS = ['Scanning…', 'Matching…', 'Done'];
+
+// ─── Match Quality Label Helper ───────────────────────────────────────────────
+const getMatchLabel = (score: number): { label: string; color: string; bg: string } => {
+  if (score >= 90) return { label: 'Perfect Match', color: 'var(--green)', bg: 'var(--green-bg)' };
+  if (score >= 75) return { label: 'Great Match', color: 'var(--green)', bg: 'var(--green-bg)' };
+  if (score >= 60) return { label: 'Good Match', color: 'var(--amber)', bg: 'var(--amber-bg)' };
+  if (score >= 45) return { label: 'Okay Match', color: 'var(--amber)', bg: 'var(--amber-bg)' };
+  if (score >= 30) return { label: 'Fair Match', color: '#D97706', bg: '#FEF3C7' };
+  return { label: 'Not a Good Match', color: 'var(--red)', bg: 'var(--red-bg)' };
+};
 
 // ─── Per-company strengths ────────────────────────────────────────────────────
 const getCompanyStrengths = (companyName: string, jobs: Job[], matched: string[]) => {
@@ -182,6 +193,16 @@ const getCompanyInsights = (results: Array<{ job: Job; score: number; matched: s
     .slice(0, 5);
 };
 
+// ─── Result type ─────────────────────────────────────────────────────────────
+type AnalysisResult = {
+  job: Job;
+  score: number;
+  matched: string[];
+  verdict?: { tier: string; badge: string; flavour_text: string };
+};
+
+const BACKEND_URL = 'http://localhost:8000';
+
 // ─── App ──────────────────────────────────────────────────────────────────────
 export default function App() {
   const [currentView, setCurrentView] = useState<View>('landing');
@@ -190,7 +211,8 @@ export default function App() {
   const [fileObj, setFileObj] = useState<File | null>(null);
   const [drag, setDrag] = useState(false);
   const [step, setStep] = useState(0);
-  const [results, setResults] = useState<Array<{ job: Job; score: number; matched: string[] }>>([]);
+  const [results, setResults] = useState<AnalysisResult[]>([]);
+  const [analyseError, setAnalyseError] = useState<string | null>(null);
   const [sort, setSort] = useState<'match' | 'salary' | 'date'>('date');
   const [filterRegion, setFilterRegion] = useState('All Regions');
   const [filterType, setFilterType] = useState('All Categories');
@@ -198,6 +220,8 @@ export default function App() {
   const [filterSalary, setFilterSalary] = useState('Any Salary');
   const [selectedJobId, setSelectedJobId] = useState<number | null>(null);
   const [showAnalysis, setShowAnalysis] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [filterUrgent, setFilterUrgent] = useState(false);
   const fRef = useRef<HTMLInputElement>(null);
 
   const accept = (f: File) => { setFile(f.name); setFileObj(f); setPhase('uploaded'); };
@@ -214,74 +238,93 @@ export default function App() {
     if (f) accept(f);
   };
 
-  const calcScore = (job: Job) => {
-    const matched = job.skills.filter((s) => EXTRACTED_SKILLS.includes(s));
-    const baseScore = Math.round((matched.length / job.skills.length) * 100);
-    const randomBonus = Math.floor(Math.random() * 9);
-    return { score: Math.min(98, baseScore + randomBonus), matched };
-  };
-
   const analyse = async () => {
     if (!fileObj) return;
-
     setPhase('analyzing');
     setStep(0);
+    setAnalyseError(null);
     setCurrentView('browse');
 
-    let currentStep = 0;
-    const interval = setInterval(() => {
-      currentStep++;
-      if (currentStep < ANALYSIS_STEPS.length - 1) {
-        setStep(currentStep);
-      }
-    }, 1200);
+    // Advance the step indicator while the request is in flight
+    const stepTimer = setInterval(() => {
+      setStep((s) => (s < ANALYSIS_STEPS.length - 2 ? s + 1 : s));
+    }, 800);
 
     try {
-      const formData = new FormData();
-      formData.append('file', fileObj);
-      formData.append('jobs', JSON.stringify(JOBS));
-
-      const res = await fetch('http://localhost:8000/analyze', {
-        method: 'POST',
-        body: formData
-      });
-
-      if (!res.ok) throw new Error('API Error');
-
-      const data = await res.json();
-      clearInterval(interval);
-      setStep(ANALYSIS_STEPS.length - 1);
-
-      const scored = data.results.map((r: any) => ({
-        job: JOBS.find((j) => j.id === r.jobId),
-        score: Math.round(r.score),
-        matched: r.matched_skills && r.matched_skills.length > 0 ? r.matched_skills : EXTRACTED_SKILLS
+      const payload = JOBS.map((j) => ({
+        id:     j.id,
+        desc:   j.desc,
+        skills: j.skills,
+        level:  j.level,
       }));
 
+      const form = new FormData();
+      form.append('file', fileObj);
+      form.append('jobs', JSON.stringify(payload));
+
+      const res = await fetch(`${BACKEND_URL}/analyze`, { method: 'POST', body: form });
+      if (!res.ok) throw new Error(`Server error: ${res.status}`);
+
+      const data = await res.json();
+
+      // Build a lookup from jobId → backend result
+      const byId = new Map<number, { score: number; matched_skills: string[]; verdict?: AnalysisResult['verdict'] }>();
+      for (const r of data.results) {
+        byId.set(r.jobId, { score: r.score, matched_skills: r.matched_skills, verdict: r.verdict });
+      }
+
+      const scored: AnalysisResult[] = JOBS.map((job) => {
+        const hit = byId.get(job.id);
+        return {
+          job,
+          score:   hit ? hit.score          : 0,
+          matched: hit ? hit.matched_skills  : [],
+          verdict: hit?.verdict,
+        };
+      }).sort((a, b) => b.score - a.score);
+
+      clearInterval(stepTimer);
+      setStep(ANALYSIS_STEPS.length - 1);
       setResults(scored);
       setPhase('done');
       setSort('match');
-    } catch (e) {
-      clearInterval(interval);
-      console.error(e);
-      alert('Failed to analyze resume. Is the backend running?');
-      setPhase('uploaded');
+    } catch (err) {
+      clearInterval(stepTimer);
+      const msg = err instanceof Error ? err.message : String(err);
+      setAnalyseError(msg);
+      setPhase('uploaded'); // allow retry
     }
   };
 
   const reset = () => {
-    setPhase('idle'); setFile(null); setFileObj(null); setStep(0); setResults([]);
+    setPhase('idle'); setFile(null); setFileObj(null); setStep(0);
+    setResults([]); setAnalyseError(null);
     setSort('date'); setFilterRegion('All Regions'); setFilterType('All Categories');
     setFilterLevel('All Levels'); setFilterSalary('Any Salary');
+    setFilterUrgent(false);
     setSelectedJobId(null); setShowAnalysis(false);
   };
 
   const displayedJobs = useMemo(() => {
     const list = phase === 'done' ? results : JOBS.map((job) => ({ job, score: 0, matched: [] }));
     return list
+      .filter((r) => {
+        if (!searchQuery.trim()) return true;
+        const q = searchQuery.toLowerCase();
+        return (
+          r.job.title.toLowerCase().includes(q) ||
+          r.job.company.toLowerCase().includes(q) ||
+          r.job.region.toLowerCase().includes(q) ||
+          r.job.macro.toLowerCase().includes(q) ||
+          r.job.type.toLowerCase().includes(q) ||
+          r.job.skills.some((s) => s.toLowerCase().includes(q)) ||
+          r.job.desc.toLowerCase().includes(q)
+        );
+      })
       .filter((r) => filterRegion === 'All Regions' || r.job.macro === filterRegion)
       .filter((r) => filterType === 'All Categories' || r.job.type === filterType)
       .filter((r) => filterLevel === 'All Levels' || r.job.level === filterLevel)
+      .filter((r) => !filterUrgent || r.job.urgent)
       .filter((r) => {
         if (filterSalary === 'Any Salary') return true;
         const v = parseFloat(r.job.salary.replace(/[^\d.]/g, ''));
@@ -291,7 +334,7 @@ export default function App() {
         if (filterSalary === '₱8M+') return v >= 8;
         return true;
       });
-  }, [results, phase, filterRegion, filterType, filterLevel, filterSalary]);
+  }, [results, phase, filterRegion, filterType, filterLevel, filterSalary, searchQuery, filterUrgent]);
 
   const sortedJobs = useMemo(() => {
     const list = [...displayedJobs];
@@ -350,11 +393,11 @@ export default function App() {
         className="sticky top-0 z-50 flex items-center justify-between gap-8 px-8 border-b"
         style={{ height: '64px', background: 'var(--surface)', borderColor: 'var(--border)', boxShadow: 'var(--s1)' }}
       >
-        <button onClick={() => setCurrentView('landing')} className="flex items-center gap-3">
-          <Icon.Pokedex size={24} color="var(--red)" />
-          <div>
-            <div style={{ fontSize: '18px', fontWeight: 800, fontFamily: 'DM Sans', color: 'var(--t1)' }}>DexMatch</div>
-            <div style={{ fontSize: '10px', color: 'var(--t4)', marginTop: '-2px' }}>Career Network</div>
+        <button onClick={() => setCurrentView('landing')} className="flex items-center gap-3 shrink-0">
+          <img src={dexMatchLogo} alt="DexMatch Logo" style={{ width: '38px', height: '38px', objectFit: 'contain' }} />
+          <div className="flex flex-col items-start">
+            <div style={{ fontSize: '18px', fontWeight: 900, fontFamily: 'DM Sans', color: 'var(--t1)', lineHeight: 1.1 }}>DexMatch</div>
+            <div style={{ fontSize: '10px', color: 'var(--t4)', letterSpacing: '0.3px' }}>Career Network</div>
           </div>
         </button>
 
@@ -365,10 +408,20 @@ export default function App() {
             </div>
             <input
               type="text"
-              placeholder="Search roles, companies, regions…"
+              placeholder="Search roles, companies, skills, regions…"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
               className="w-full h-[40px] px-3 pl-9 rounded-lg text-sm outline-none border"
-              style={{ background: 'var(--surface)', borderColor: 'var(--border)', color: 'var(--t1)' }}
+              style={{ background: 'var(--surface)', borderColor: searchQuery ? 'var(--red)' : 'var(--border)', color: 'var(--t1)' }}
             />
+            {searchQuery && (
+              <button
+                className="absolute right-3 top-1/2 -translate-y-1/2"
+                onClick={() => setSearchQuery('')}
+              >
+                <Icon.Close size={12} color="var(--t3)" />
+              </button>
+            )}
           </div>
         )}
 
@@ -385,9 +438,9 @@ export default function App() {
             <button
               onClick={() => setShowAnalysis(true)}
               className="flex items-center gap-2"
-              style={{ fontSize: '14px', fontWeight: 500, color: 'var(--t2)' }}
+              style={{ fontSize: '14px', fontWeight: 500, color: 'var(--red)' }}
             >
-              <Icon.BarChart size={14} color="var(--t3)" />
+              <Icon.BarChart size={14} color="var(--red)" />
               My Analysis
             </button>
           )}
@@ -395,7 +448,8 @@ export default function App() {
           <button
             className="px-5 py-2.5 rounded-lg text-white font-semibold text-sm"
             style={{ background: 'var(--red)' }}
-          >Sign In</button>
+            onClick={() => { setCurrentView('browse'); setTimeout(() => fRef.current?.click(), 100); }}
+          >Get Started</button>
         </div>
       </header>
 
@@ -406,7 +460,12 @@ export default function App() {
           onUploadCV={() => { setCurrentView('browse'); setTimeout(() => fRef.current?.click(), 100); }}
         />
       ) : currentView === 'companies' ? (
-        <CompaniesView />
+        <CompaniesView
+          onBrowseCompany={(company) => {
+            setSearchQuery(company);
+            setCurrentView('browse');
+          }}
+        />
       ) : (
         <>
           {showAnalysis && phase === 'done' && (
@@ -430,6 +489,7 @@ export default function App() {
                 results={results} strongMatches={strongMatches} fRef={fRef}
                 handleFileChange={handleFileChange} handleDrop={handleDrop}
                 setDrag={setDrag} analyse={analyse} reset={reset}
+                analyseError={analyseError}
                 onShowAnalysis={() => setShowAnalysis(true)}
               />
             </div>
@@ -440,7 +500,9 @@ export default function App() {
               filterType={filterType} setFilterType={setFilterType}
               filterLevel={filterLevel} setFilterLevel={setFilterLevel}
               filterSalary={filterSalary} setFilterSalary={setFilterSalary}
+              filterUrgent={filterUrgent} setFilterUrgent={setFilterUrgent}
               allLevels={allLevels}
+              searchQuery={searchQuery}
             />
           </div>
         </>
@@ -452,6 +514,28 @@ export default function App() {
         @keyframes slideDown { from { opacity:0; transform:translateY(-20px); } to { opacity:1; transform:translateY(0); } }
         @keyframes progressFill { from { width:0; } }
       `}</style>
+    </div>
+  );
+}
+
+// ─── Half Circle Step Indicator ──────────────────────────────────────────────
+function HalfCircleStep({ label }: { label: string }) {
+  return (
+    <div className="flex justify-center mb-5">
+      <div className="relative flex items-end justify-center" style={{ width: '80px', height: '40px' }}>
+        {/* Outer navy arc */}
+        <svg width="80" height="40" viewBox="0 0 80 40" fill="none" xmlns="http://www.w3.org/2000/svg" style={{ position: 'absolute', top: 0, left: 0 }}>
+          <path d="M2 40 A38 38 0 0 1 78 40 Z" fill="#1A1E35" />
+        </svg>
+        {/* Inner red fill */}
+        <svg width="80" height="40" viewBox="0 0 80 40" fill="none" xmlns="http://www.w3.org/2000/svg" style={{ position: 'absolute', top: 0, left: 0 }}>
+          <path d="M7 40 A33 33 0 0 1 73 40 Z" fill="#D93922" />
+        </svg>
+        {/* Step label */}
+        <svg width="80" height="40" viewBox="0 0 80 40" fill="none" xmlns="http://www.w3.org/2000/svg" style={{ position: 'relative', zIndex: 1 }}>
+          <text x="40" y="34" textAnchor="middle" fontSize="15" fontWeight="900" fill="white" fontFamily="DM Mono, monospace">{label}</text>
+        </svg>
+      </div>
     </div>
   );
 }
@@ -487,20 +571,9 @@ function LandingPage({ onGetStarted, onUploadCV }: { onGetStarted: () => void; o
 
         <div className="max-w-[1200px] mx-auto px-8 relative z-10">
           <div className="text-center max-w-[860px] mx-auto">
-            {/* Pokédex-style label */}
-            <div
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-full mb-6"
-              style={{ background: 'rgba(232,184,75,0.15)', border: '1px solid rgba(232,184,75,0.3)' }}
-            >
-              <Icon.Pokedex size={14} color="var(--gold)" />
-              <span style={{ fontSize: '12px', fontWeight: 700, color: 'var(--gold)', letterSpacing: '0.5px', textTransform: 'uppercase' }}>
-                Pokémon Career Network
-              </span>
-            </div>
-
             <h1
               className="mb-6"
-              style={{ fontSize: '62px', fontWeight: 900, lineHeight: 1.08, color: 'white', letterSpacing: '-0.02em' }}
+              style={{ fontSize: '58px', fontWeight: 900, lineHeight: 1.08, color: 'white', letterSpacing: '-0.02em' }}
             >
               Find Your Perfect<br />Career Match
             </h1>
@@ -509,7 +582,7 @@ function LandingPage({ onGetStarted, onUploadCV }: { onGetStarted: () => void; o
               style={{ fontSize: '19px', lineHeight: 1.65, color: 'rgba(255,255,255,0.72)', maxWidth: '640px', margin: '0 auto 48px' }}
             >
               Upload your CV and let DexMatch connect you with the best opportunities across{' '}
-              <strong style={{ color: 'var(--gold)' }}>leading companies</strong> in the Pokémon world
+              <strong style={{ color: 'var(--gold)' }}>leading companies</strong> in the network
             </p>
 
             <div className="flex gap-4 justify-center mb-20">
@@ -526,7 +599,7 @@ function LandingPage({ onGetStarted, onUploadCV }: { onGetStarted: () => void; o
                 className="px-10 py-5 rounded-xl font-bold text-lg transition-all"
                 style={{ background: 'rgba(255,255,255,0.08)', border: '2px solid rgba(255,255,255,0.18)', color: 'white' }}
               >
-                Browse {TOTAL_OPENINGS} Jobs
+                Browse {DISPLAY_OPENINGS} Jobs
               </button>
             </div>
 
@@ -535,7 +608,7 @@ function LandingPage({ onGetStarted, onUploadCV }: { onGetStarted: () => void; o
               {[
                 { num: UNIQUE_COMPANIES, label: 'Partner Companies' },
                 { num: UNIQUE_REGIONS.length, label: 'Regions' },
-                { num: TOTAL_OPENINGS, label: 'Open Positions' },
+                { num: DISPLAY_OPENINGS, label: 'Open Positions' },
               ].map((s, i) => (
                 <div key={i}>
                   <div style={{ fontFamily: 'DM Mono', fontSize: '40px', fontWeight: 700, color: 'var(--gold)', letterSpacing: '-0.02em' }}>
@@ -568,21 +641,18 @@ function LandingPage({ onGetStarted, onUploadCV }: { onGetStarted: () => void; o
             {[
               {
                 icon: Icon.Upload,
-                iconColor: '#4D9EFF',
                 step: '01',
                 title: 'Upload Your Profile',
                 desc: 'Upload your CV in PDF, DOCX, or TXT format. Our system extracts your skills, experience, and qualifications instantly.',
               },
               {
                 icon: Icon.Sparkle,
-                iconColor: '#FFB830',
                 step: '02',
                 title: 'Get Instant Analysis',
                 desc: 'Receive personalised match scores for every position. See detailed insights on company fit and skill alignment.',
               },
               {
                 icon: Icon.Briefcase,
-                iconColor: 'var(--red)',
                 step: '03',
                 title: 'Apply with Confidence',
                 desc: 'Review improvement suggestions and strengths analysis per company, then apply to your top matches.',
@@ -590,25 +660,20 @@ function LandingPage({ onGetStarted, onUploadCV }: { onGetStarted: () => void; o
             ].map((item, i) => (
               <div
                 key={i}
-                className="relative p-8 rounded-2xl border transition-all hover:shadow-xl"
+                className="p-8 rounded-2xl border transition-all hover:shadow-xl"
                 style={{ background: 'var(--surface)', borderColor: 'var(--border)' }}
               >
-                {/* Step number */}
-                <div
-                  className="absolute -top-5 left-8 w-12 h-12 rounded-full flex items-center justify-center"
-                  style={{ background: 'var(--red)', color: 'white', fontSize: '13px', fontWeight: 800, fontFamily: 'DM Mono' }}
-                >
-                  {item.step}
+                {/* Half-circle step number */}
+                <HalfCircleStep label={item.step} />
+
+                <div className="mb-4 flex justify-center">
+                  <item.icon size={36} color="var(--red)" />
                 </div>
 
-                <div className="mb-4 mt-6">
-                  <item.icon size={32} color={item.iconColor} />
-                </div>
-
-                <h3 className="mb-3" style={{ fontSize: '21px', fontWeight: 700, color: 'var(--t1)' }}>
+                <h3 className="mb-3 text-center" style={{ fontSize: '21px', fontWeight: 700, color: 'var(--t1)' }}>
                   {item.title}
                 </h3>
-                <p style={{ fontSize: '14px', lineHeight: 1.65, color: 'var(--t3)' }}>{item.desc}</p>
+                <p className="text-center" style={{ fontSize: '14px', lineHeight: 1.65, color: 'var(--t3)' }}>{item.desc}</p>
               </div>
             ))}
           </div>
@@ -636,7 +701,7 @@ function LandingPage({ onGetStarted, onUploadCV }: { onGetStarted: () => void; o
             Ready to Find Your Dream Career?
           </h2>
           <p className="mb-10" style={{ fontSize: '18px', color: 'rgba(255,255,255,0.65)', lineHeight: 1.6 }}>
-            Join thousands of trainers who found their perfect role through DexMatch
+            Join thousands of professionals who found their perfect role through DexMatch
           </p>
           <button
             onClick={onUploadCV}
@@ -653,7 +718,7 @@ function LandingPage({ onGetStarted, onUploadCV }: { onGetStarted: () => void; o
 }
 
 // ─── Profile Analyzer ─────────────────────────────────────────────────────────
-function ProfileAnalyzer({ phase, file, drag, step, pct, results, strongMatches, fRef, handleFileChange, handleDrop, setDrag, analyse, reset, onShowAnalysis }: any) {
+function ProfileAnalyzer({ phase, file, drag, step, pct, results, strongMatches, fRef, handleFileChange, handleDrop, setDrag, analyse, reset, analyseError, onShowAnalysis }: any) {
   const STEPS = ['Scanning…', 'Matching…', 'Done'];
 
   return (
@@ -662,14 +727,22 @@ function ProfileAnalyzer({ phase, file, drag, step, pct, results, strongMatches,
       style={{ background: 'var(--surface)', borderColor: 'var(--border)', boxShadow: 'var(--s2)' }}
     >
       <div className="max-w-[1000px] mx-auto">
+        {analyseError && (
+          <div
+            className="mb-4 px-4 py-3 rounded-lg text-sm flex items-start gap-2"
+            style={{ background: 'var(--red-bg)', color: 'var(--red)', border: '1px solid var(--red)' }}
+          >
+            <span style={{ fontWeight: 700 }}>Backend error:</span>
+            <span>{analyseError} — make sure the Python server is running (<code>uvicorn main:app --reload</code>)</span>
+          </div>
+        )}
         <div className="text-center mb-6">
           <div className="flex items-center justify-center gap-3 mb-3">
-            <Icon.Sparkle size={26} color="var(--gold)" />
             <h1 style={{ fontSize: '30px', fontWeight: 800, color: 'var(--t1)' }}>Profile Analyzer</h1>
           </div>
           <p style={{ fontSize: '15px', color: 'var(--t3)', maxWidth: '580px', margin: '0 auto' }}>
             {phase === 'done'
-              ? `Analysis complete! ${strongMatches} strong matches found from ${results.length} positions`
+              ? `Analysis complete! ${strongMatches} strong matches found across ${DISPLAY_OPENINGS} open positions`
               : 'Upload your CV and DexMatch will match you with the best opportunities'}
           </p>
         </div>
@@ -692,7 +765,7 @@ function ProfileAnalyzer({ phase, file, drag, step, pct, results, strongMatches,
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
               {[
                 { val: EXTRACTED_SKILLS.length, label: 'Skills Detected', color: 'var(--green)', bg: 'var(--green-bg)', border: 'var(--green)' },
-                { val: results.length, label: 'Positions Analysed', color: 'var(--amber)', bg: 'var(--amber-bg)', border: 'var(--amber)' },
+                { val: DISPLAY_OPENINGS, label: 'Positions Available', color: 'var(--amber)', bg: 'var(--amber-bg)', border: 'var(--amber)' },
                 { val: strongMatches, label: 'Strong Matches', color: 'var(--green)', bg: 'var(--green-bg)', border: 'var(--green)' },
               ].map((stat, i) => (
                 <div key={i} className="p-5 rounded-xl text-center" style={{ background: stat.bg, border: `1px solid ${stat.border}` }}>
@@ -705,7 +778,7 @@ function ProfileAnalyzer({ phase, file, drag, step, pct, results, strongMatches,
               <button
                 onClick={onShowAnalysis}
                 className="px-8 py-3 rounded-lg font-semibold flex items-center gap-2 transition-all hover:shadow-md"
-                style={{ background: 'var(--navy)', color: 'white' }}
+                style={{ background: 'var(--red)', color: 'white' }}
               >
                 <Icon.BarChart size={16} color="white" />
                 View Full Analysis
@@ -722,7 +795,7 @@ function ProfileAnalyzer({ phase, file, drag, step, pct, results, strongMatches,
         ) : (
           <div>
             <div
-              className="border-2 border-dashed rounded-xl p-16 text-center cursor-pointer transition-all mb-4"
+              className="border-2 border-dashed rounded-xl p-16 cursor-pointer transition-all mb-4"
               style={{
                 borderColor: drag ? 'var(--red)' : phase === 'uploaded' ? 'var(--green)' : 'var(--border-2)',
                 background: drag ? 'color-mix(in srgb, var(--red) 4%, var(--surface))' : phase === 'uploaded' ? 'var(--green-bg)' : 'var(--surface-2)',
@@ -732,18 +805,24 @@ function ProfileAnalyzer({ phase, file, drag, step, pct, results, strongMatches,
               onDrop={handleDrop}
               onClick={() => fRef.current?.click()}
             >
-              <input ref={fRef} type="file" accept=".pdf,.doc,.docx,.txt,.png,.jpg,.jpeg" className="hidden" onChange={handleFileChange} />
+              <input ref={fRef} type="file" accept=".pdf,.doc,.docx,.txt" className="hidden" onChange={handleFileChange} />
               {phase === 'uploaded' ? (
-                <div>
+                <div className="flex flex-col items-center">
                   <Icon.Check size={44} color="var(--green)" />
                   <div className="mt-4" style={{ fontSize: '17px', fontWeight: 700, color: 'var(--green)' }}>{file}</div>
                   <div className="mt-2" style={{ fontSize: '13px', color: 'var(--t3)' }}>Click to replace or drag another file</div>
                 </div>
               ) : (
-                <div>
-                  <Icon.Upload size={44} color="var(--t3)" />
-                  <div className="mt-4" style={{ fontSize: '19px', fontWeight: 700, color: 'var(--t1)' }}>Drop your CV here</div>
+                <div className="flex flex-col items-center">
+                  <div className="flex items-center justify-center w-16 h-16 rounded-2xl mb-2"
+                    style={{ background: 'color-mix(in srgb, var(--red) 10%, var(--surface-2))' }}>
+                    <Icon.Upload size={36} color="var(--red)" />
+                  </div>
+                  <div className="mt-3" style={{ fontSize: '19px', fontWeight: 700, color: 'var(--t1)' }}>Drop your CV here</div>
                   <div className="mt-2" style={{ fontSize: '13px', color: 'var(--t3)' }}>Supports PDF, DOCX, and TXT formats</div>
+                  <div className="mt-4 px-4 py-1.5 rounded-full" style={{ background: 'var(--red-bg)', fontSize: '11px', color: 'var(--red)', fontWeight: 600 }}>
+                    {DISPLAY_OPENINGS} positions available to match
+                  </div>
                 </div>
               )}
             </div>
@@ -788,7 +867,7 @@ function AnalysisModal({ onClose, results, companyInsights, suggestions, strongM
             style={{ background: 'linear-gradient(135deg, var(--navy) 0%, #1A1E35 100%)', borderColor: 'var(--border)' }}
           >
             <div className="flex items-center gap-3">
-              <Icon.BarChart size={22} color="var(--gold)" />
+              <Icon.BarChart size={22} color="var(--red)" />
               <h2 style={{ fontSize: '22px', fontWeight: 700, color: 'white' }}>Your Profile Analysis</h2>
             </div>
             <div className="flex items-center gap-2">
@@ -823,7 +902,7 @@ function AnalysisModal({ onClose, results, companyInsights, suggestions, strongM
             <div className="grid grid-cols-3 gap-4 mb-8">
               {[
                 { val: EXTRACTED_SKILLS.length, label: 'Skills Detected', color: 'var(--green)', bg: 'var(--green-bg)', border: 'var(--green)' },
-                { val: results.length, label: 'Positions Matched', color: 'var(--amber)', bg: 'var(--amber-bg)', border: 'var(--amber)' },
+                { val: DISPLAY_OPENINGS, label: 'Positions Available', color: 'var(--amber)', bg: 'var(--amber-bg)', border: 'var(--amber)' },
                 { val: strongMatches, label: 'Strong Matches (80%+)', color: 'var(--green)', bg: 'var(--green-bg)', border: 'var(--green)' },
               ].map((s, i) => (
                 <div key={i} className="p-5 rounded-xl" style={{ background: s.bg, border: `1px solid ${s.border}` }}>
@@ -881,8 +960,9 @@ function AnalysisModal({ onClose, results, companyInsights, suggestions, strongM
                   const company = COMPANIES[insight.company];
                   const strengths = getCompanyStrengths(insight.company, JOBS, EXTRACTED_SKILLS);
                   const improvements = getCompanyImprovements(insight.company, JOBS, EXTRACTED_SKILLS);
-                  const scoreColor = insight.avgScore >= 80 ? 'var(--green)' : insight.avgScore >= 60 ? 'var(--amber)' : 'var(--red)';
-                  const scoreBg = insight.avgScore >= 80 ? 'var(--green-bg)' : insight.avgScore >= 60 ? 'var(--amber-bg)' : 'var(--red-bg)';
+                  const matchInfo = getMatchLabel(insight.avgScore);
+                  const scoreColor = matchInfo.color;
+                  const scoreBg = matchInfo.bg;
 
                   return (
                     <div key={i} className="rounded-2xl border overflow-hidden" style={{ borderColor: 'var(--border)' }}>
@@ -890,15 +970,14 @@ function AnalysisModal({ onClose, results, companyInsights, suggestions, strongM
                       <div className="p-5 flex items-center justify-between" style={{ background: 'var(--surface-2)' }}>
                         <div className="flex items-center gap-3">
                           <div
-                            className="w-11 h-11 rounded-xl flex items-center justify-center overflow-hidden shrink-0"
-                            style={{ background: company.logoBg }}
+                            className="w-11 h-11 rounded-xl flex items-center justify-center text-sm font-black shrink-0 overflow-hidden"
+                            style={{ background: company.logoBg, color: company.logoText }}
                           >
-                            <img 
-                              src={company.logo} 
-                              alt={insight.company} 
-                              className="w-full h-full object-cover"
-                              onError={(e) => { e.currentTarget.style.display = 'none'; }}
-                            />
+                            {typeof company.logo === 'string' && company.logo.length > 5 ? (
+                              <img src={company.logo} alt={company.logoText} className="w-full h-full object-cover" />
+                            ) : (
+                              company.logo
+                            )}
                           </div>
                           <div>
                             <div style={{ fontSize: '15px', fontWeight: 700, color: 'var(--t1)' }}>{insight.company}</div>
@@ -907,11 +986,19 @@ function AnalysisModal({ onClose, results, companyInsights, suggestions, strongM
                             </div>
                           </div>
                         </div>
-                        <div
-                          className="px-4 py-2 rounded-xl"
-                          style={{ background: scoreBg, color: scoreColor, fontFamily: 'DM Mono', fontSize: '20px', fontWeight: 700 }}
-                        >
-                          {insight.avgScore}%
+                        <div className="flex flex-col items-end gap-1">
+                          <div
+                            className="px-4 py-2 rounded-xl"
+                            style={{ background: scoreBg, color: scoreColor, fontFamily: 'DM Mono', fontSize: '20px', fontWeight: 700 }}
+                          >
+                            {insight.avgScore}%
+                          </div>
+                          <div
+                            className="px-2.5 py-0.5 rounded-full text-[10px] font-bold"
+                            style={{ background: scoreBg, color: scoreColor }}
+                          >
+                            {matchInfo.label}
+                          </div>
                         </div>
                       </div>
 
@@ -1026,7 +1113,7 @@ function AnalysisModal({ onClose, results, companyInsights, suggestions, strongM
 }
 
 // ─── Jobs Section ─────────────────────────────────────────────────────────────
-function JobsSection({ sortedJobs, selectedJobId, setSelectedJobId, showScore, sort, setSort, phase, filterRegion, setFilterRegion, filterType, setFilterType, filterLevel, setFilterLevel, filterSalary, setFilterSalary, allLevels }: any) {
+function JobsSection({ sortedJobs, selectedJobId, setSelectedJobId, showScore, sort, setSort, phase, filterRegion, setFilterRegion, filterType, setFilterType, filterLevel, setFilterLevel, filterSalary, setFilterSalary, filterUrgent, setFilterUrgent, allLevels, searchQuery }: any) {
   return (
     <div>
       <div className="mb-6 p-6 rounded-xl border" style={{ background: 'var(--surface)', borderColor: 'var(--border)' }}>
@@ -1034,6 +1121,7 @@ function JobsSection({ sortedJobs, selectedJobId, setSelectedJobId, showScore, s
           <div>
             <h2 style={{ fontSize: '19px', fontWeight: 700, color: 'var(--t1)' }}>
               {sortedJobs.length} Position{sortedJobs.length !== 1 ? 's' : ''} Available
+              {searchQuery && <span style={{ fontSize: '14px', fontWeight: 400, color: 'var(--t3)' }}> for "{searchQuery}"</span>}
             </h2>
             <p style={{ fontSize: '12px', color: 'var(--t3)' }}>
               {phase === 'done' ? 'Sorted by best match' : 'Browse all opportunities'}
@@ -1086,9 +1174,25 @@ function JobsSection({ sortedJobs, selectedJobId, setSelectedJobId, showScore, s
               {sel.options.map((o) => <option key={o}>{o}</option>)}
             </select>
           ))}
-          {(filterRegion !== 'All Regions' || filterType !== 'All Categories' || filterLevel !== 'All Levels' || filterSalary !== 'Any Salary') && (
+          {/* Urgent-only toggle */}
+          <button
+            onClick={() => setFilterUrgent(!filterUrgent)}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border transition-all"
+            style={{
+              background: filterUrgent ? 'var(--red)' : 'var(--surface)',
+              borderColor: filterUrgent ? 'var(--red)' : 'var(--border)',
+              color: filterUrgent ? 'white' : 'var(--t3)',
+              fontSize: '11px',
+              fontWeight: 700,
+            }}
+          >
+            <Icon.Lightning size={11} color={filterUrgent ? 'white' : 'var(--t3)'} />
+            Urgent Hire
+          </button>
+
+          {(filterRegion !== 'All Regions' || filterType !== 'All Categories' || filterLevel !== 'All Levels' || filterSalary !== 'Any Salary' || filterUrgent) && (
             <button
-              onClick={() => { setFilterRegion('All Regions'); setFilterType('All Categories'); setFilterLevel('All Levels'); setFilterSalary('Any Salary'); }}
+              onClick={() => { setFilterRegion('All Regions'); setFilterType('All Categories'); setFilterLevel('All Levels'); setFilterSalary('Any Salary'); setFilterUrgent(false); }}
               style={{ fontSize: '12px', color: 'var(--red)', fontWeight: 600 }}
             >
               Clear Filters
@@ -1118,83 +1222,252 @@ function JobCard({ result, selected, onClick, showScore }: { result: { job: Job;
   const company = COMPANIES[job.company];
   const typeInfo = JOB_TYPES[job.type as JobType];
 
+  // Industry-coded left border for normal cards; full box highlight for urgent
+  const urgentStyle = job.urgent
+    ? {
+        border: '2px solid var(--red)',
+        background: selected
+          ? 'color-mix(in srgb, var(--red) 6%, var(--surface))'
+          : 'color-mix(in srgb, var(--red) 3%, var(--surface))',
+        boxShadow: '0 4px 16px rgba(217,57,34,0.14)',
+      }
+    : {
+        borderTop: `1px solid ${selected ? 'var(--navy)' : 'var(--border)'}`,
+        borderRight: `1px solid ${selected ? 'var(--navy)' : 'var(--border)'}`,
+        borderBottom: `1px solid ${selected ? 'var(--navy)' : 'var(--border)'}`,
+        borderLeft: `3px solid ${typeInfo.barColor}`,
+        background: selected ? 'color-mix(in srgb, var(--navy) 3%, var(--surface))' : 'var(--surface)',
+        boxShadow: selected ? 'var(--s2)' : 'none',
+      };
+
   return (
     <button
       onClick={onClick}
-      className="text-left p-4 rounded-xl border transition-all hover:shadow-lg w-full"
-      style={{
-        background: 'var(--surface)',
-        borderTopColor: selected ? 'var(--navy)' : 'var(--border)',
-        borderRightColor: selected ? 'var(--navy)' : 'var(--border)',
-        borderBottomColor: selected ? 'var(--navy)' : 'var(--border)',
-        borderLeftColor: job.urgent ? 'var(--red)' : 'transparent',
-        borderLeftWidth: '3px',
-        borderLeftStyle: 'solid',
-        boxShadow: selected ? 'var(--s2)' : 'none',
-      }}
+      className="text-left rounded-xl transition-all hover:shadow-lg w-full overflow-hidden flex flex-col"
+      style={urgentStyle}
     >
-      <div className="flex items-start justify-between mb-3">
-        <div className="flex items-center gap-2">
-          <div
-            className="w-10 h-10 rounded-lg flex items-center justify-center overflow-hidden shrink-0"
-            style={{ background: company.logoBg }}
-          >
-            <img 
-              src={company.logo} 
-              alt={job.company} 
-              className="w-full h-full object-cover"
-              onError={(e) => { e.currentTarget.style.display = 'none'; }}
-            />
-          </div>
-          <div>
-            <div style={{ fontSize: '11px', fontWeight: 700, color: 'var(--t2)' }}>{job.company}</div>
-            <div style={{ fontSize: '10px', color: 'var(--t4)' }}>{job.region}</div>
-          </div>
+      {/* Urgent banner */}
+      {job.urgent && (
+        <div
+          className="px-3 py-1.5 flex items-center gap-1.5"
+          style={{ background: 'var(--red)' }}
+        >
+          <Icon.Lightning size={10} color="white" />
+          <span style={{ fontSize: '10px', fontWeight: 800, color: 'white', letterSpacing: '0.6px', textTransform: 'uppercase' }}>
+            Urgent Hire
+          </span>
         </div>
-        {showScore && (
-          <div
-            className="px-2.5 py-1 rounded-lg text-sm font-bold"
-            style={{
-              fontFamily: 'DM Mono',
-              background: score >= 80 ? 'var(--green-bg)' : score >= 50 ? 'var(--amber-bg)' : 'var(--red-bg)',
-              color: score >= 80 ? 'var(--green)' : score >= 50 ? 'var(--amber)' : 'var(--red)',
-            }}
-          >
-            {score}%
+      )}
+
+      <div className="p-4 flex flex-col flex-1">
+        {/* Company row */}
+        <div className="flex items-start justify-between mb-3">
+          <div className="flex items-center gap-2 min-w-0">
+            <div
+              className="w-9 h-9 rounded-lg flex items-center justify-center text-xs font-black overflow-hidden shrink-0"
+              style={{ background: company.logoBg, color: company.logoText }}
+            >
+              {typeof company.logo === 'string' && company.logo.length > 5 ? (
+                <img src={company.logo} alt={company.logoText} className="w-full h-full object-cover" />
+              ) : (
+                company.logo
+              )}
+            </div>
+            <div className="min-w-0">
+              <div style={{ fontSize: '11px', fontWeight: 700, color: 'var(--t2)' }} className="truncate">{job.company}</div>
+              <div style={{ fontSize: '10px', color: 'var(--t4)' }}>{job.region}</div>
+            </div>
           </div>
-        )}
-      </div>
+          {showScore && (() => {
+            const ml = getMatchLabel(score);
+            return (
+              <div className="flex flex-col items-end gap-0.5 shrink-0 ml-1">
+                <div
+                  className="px-2 py-0.5 rounded-md text-xs font-bold"
+                  style={{ fontFamily: 'DM Mono', background: ml.bg, color: ml.color }}
+                >
+                  {score}%
+                </div>
+                <div
+                  className="px-1.5 py-0.5 rounded text-[9px] font-bold whitespace-nowrap"
+                  style={{ background: ml.bg, color: ml.color }}
+                >
+                  {ml.label}
+                </div>
+              </div>
+            );
+          })()}
+        </div>
 
-      <h3 style={{ fontSize: '14px', fontWeight: 700, color: 'var(--t1)', marginBottom: '8px', lineHeight: 1.3 }}>
-        {job.title}
-      </h3>
+        {/* Industry type badge */}
+        <div className="mb-2">
+          <span
+            className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold"
+            style={{ background: typeInfo.bg, color: typeInfo.color, border: `1px solid ${typeInfo.barColor}33` }}
+          >
+            {job.type}
+          </span>
+        </div>
 
-      <div className="flex flex-wrap items-center gap-1.5 mb-3" style={{ color: 'var(--t3)', fontSize: '11px' }}>
-        <span style={{ fontFamily: 'DM Mono', fontWeight: 600 }}>{job.salary}</span>
-        <span>·</span>
-        <span>{job.level}</span>
-        {job.urgent && (
-          <span className="flex items-center gap-1" style={{ color: 'var(--red)', fontWeight: 700 }}>
-            · <Icon.Lightning size={9} color="var(--red)" /> URGENT
-          </span>
-        )}
-      </div>
+        {/* Job title */}
+        <h3 style={{ fontSize: '13px', fontWeight: 700, color: 'var(--t1)', marginBottom: '6px', lineHeight: 1.3 }}>
+          {job.title}
+        </h3>
 
-      <div className="flex flex-wrap gap-1">
-        {job.skills.slice(0, 3).map((skill: string, i: number) => (
-          <span key={i} className="px-2 py-1 rounded text-[10px] font-semibold" style={{ background: typeInfo.bg, color: typeInfo.color }}>
-            {skill}
-          </span>
-        ))}
-        {job.skills.length > 3 && (
-          <span className="px-2 py-1 text-[10px] font-semibold" style={{ color: 'var(--t4)' }}>
-            +{job.skills.length - 3}
-          </span>
-        )}
+        {/* Description excerpt */}
+        <p
+          style={{
+            fontSize: '11px', color: 'var(--t3)', lineHeight: 1.6, marginBottom: '10px',
+            display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden',
+          } as React.CSSProperties}
+        >
+          {job.desc}
+        </p>
+
+        {/* Salary + level */}
+        <div className="flex items-center gap-1.5 mb-3" style={{ fontSize: '11px' }}>
+          <span style={{ fontFamily: 'DM Mono', fontWeight: 700, color: 'var(--t1)' }}>{job.salary}</span>
+          <span style={{ color: 'var(--t4)' }}>·</span>
+          <span style={{ color: 'var(--t3)' }}>{job.level}</span>
+        </div>
+
+        {/* Keyword chips */}
+        <div className="flex flex-wrap gap-1 mt-auto">
+          {job.skills.slice(0, 3).map((skill: string, i: number) => (
+            <span
+              key={i}
+              className="px-2 py-0.5 rounded text-[10px] font-semibold"
+              style={{ background: typeInfo.bg, color: typeInfo.color, border: `1px solid ${typeInfo.barColor}22` }}
+            >
+              {skill}
+            </span>
+          ))}
+          {job.skills.length > 3 && (
+            <span
+              className="px-2 py-0.5 rounded text-[10px] font-semibold"
+              style={{ background: 'var(--surface-2)', color: 'var(--t3)', border: '1px solid var(--border)' }}
+            >
+              +{job.skills.length - 3} more
+            </span>
+          )}
+        </div>
       </div>
     </button>
   );
 }
+
+// ─── Job Detail Helpers ────────────────────────────────────────────────────────
+const TYPE_RESPONSIBILITIES: Record<string, string[]> = {
+  'Research & Science': [
+    'Design and execute field research protocols to gather comprehensive species and behavioural data',
+    'Analyse datasets using statistical modelling, bioinformatics, and laboratory analysis tools',
+    'Collaborate with cross-regional research teams on multi-year longitudinal studies',
+    'Prepare peer-reviewed papers, technical reports, and policy submissions',
+    'Maintain detailed laboratory records, field documentation, and specimen logs',
+    'Present findings at regional conferences, symposiums, and internal knowledge sessions',
+  ],
+  'Battle & Training': [
+    'Develop advanced battle strategies and optimised team compositions for competitive scenarios',
+    'Train and mentor trainers of varying skill levels in type mechanics and move optimisation',
+    'Evaluate challenger and student performance; deliver structured, data-driven feedback',
+    'Maintain Pokémon team health, conditioning, and battle-readiness at all times',
+    'Coordinate with League officials on scheduling, rules, and regulatory compliance',
+    'Represent the organisation in sanctioned battles, exhibitions, and public media events',
+  ],
+  'Engineering & Tech': [
+    'Architect, develop, and maintain technical systems, platforms, and core infrastructure',
+    'Collaborate with cross-functional product and research teams on roadmap delivery',
+    'Produce comprehensive technical documentation, system specifications, and runbooks',
+    'Conduct thorough testing, debugging, and quality assurance on all deliverables',
+    'Monitor system uptime and resolve incidents within defined service-level agreements',
+    'Mentor junior engineers and lead team knowledge-sharing and code-review sessions',
+  ],
+  'Performance & Arts': [
+    'Choreograph, direct, and produce seasonal Pokémon Contest and Showcase performances',
+    'Mentor coordinators and stylists in move aesthetics, staging, and performance technique',
+    'Design, source, and manage costumes, accessories, and stage production elements',
+    'Coordinate rehearsal schedules, technical production logistics, and live event execution',
+    'Evaluate contestant and performer presentations; provide expert, constructive feedback',
+    'Cultivate partnerships with sponsors, broadcast media, and regional event organisations',
+  ],
+  'Healthcare & Welfare': [
+    'Deliver direct clinical care and treatment for injured, ill, or distressed Pokémon',
+    'Conduct routine health assessments and maintain detailed, up-to-date medical records',
+    'Coordinate with specialist teams on complex diagnostic and multi-disciplinary treatment cases',
+    'Supervise and train junior healthcare staff, interns, and Chansey assistants',
+    'Develop and implement structured wellbeing programmes for both Trainers and Pokémon',
+    'Liaise with regional health authorities to ensure ongoing regulatory compliance',
+  ],
+  'Conservation & Welfare': [
+    'Monitor, assess, and actively manage wild Pokémon habitats and surrounding ecosystems',
+    'Design and implement conservation, rehabilitation, and rewilding programmes',
+    'Conduct environmental impact assessments, biodiversity surveys, and ecological audits',
+    'Engage regional communities through conservation education and public outreach initiatives',
+    'Produce quarterly research reports and policy briefings for environmental stakeholders',
+    'Lead emergency wildlife response operations during ecological and habitat crisis events',
+  ],
+  'Law Enforcement & Patrol': [
+    'Conduct regular patrols of assigned zones and respond promptly to all incidents',
+    'Investigate illegal Pokémon capture, trafficking, and poaching operations',
+    'Coordinate multi-unit responses to large-scale ecological and public safety emergencies',
+    'Maintain accurate, detailed incident logs and submit formal reports to regional authorities',
+    'Build positive, trust-based relationships with local communities and Trainer associations',
+    'Train new recruits in field protocols, crisis response, and Capture Styler operation',
+  ],
+  'Media & Communications': [
+    'Produce and host broadcast segments, podcasts, and live event commentary',
+    'Research, script, and edit content for multiple platforms and diverse audience segments',
+    'Conduct compelling interviews with Gym Leaders, Elite Four members, and top-tier Trainers',
+    'Manage social media channels, community engagement, and regional digital strategy',
+    'Collaborate with technical production teams on broadcast quality and delivery standards',
+    'Track audience metrics and adapt content strategy based on performance analytics',
+  ],
+};
+
+const LEVEL_REQUIREMENTS: Record<string, string[]> = {
+  'Entry': [
+    'Pokémon Trainer Certificate or equivalent foundational qualification',
+    '0–1 year of relevant experience in a supervised or academic setting',
+    'Strong foundational knowledge of Pokémon species, types, and core mechanics',
+    'Excellent written and verbal communication skills, with a collaborative mindset',
+    'Willingness to work flexible hours including field, shift-based, and outdoor environments',
+  ],
+  'Entry-Mid': [
+    'Relevant diploma, degree, or equivalent professional certification',
+    '1–3 years of hands-on experience in a related role or industry',
+    'Demonstrated ability to operate independently in fast-paced, dynamic environments',
+    'Solid written and verbal communication skills across standard professional contexts',
+    'Proficiency in core technical or specialist tools relevant to the role',
+  ],
+  'Mid': [
+    "Bachelor's degree or equivalent in a relevant professional or scientific field",
+    '3–5 years of professional experience with a clear and measurable track record',
+    'Demonstrated project ownership, initiative, and cross-functional collaboration skills',
+    'Strong analytical, problem-solving, and evidence-based decision-making capabilities',
+    'Experience mentoring junior team members and contributing positively to team growth',
+  ],
+  'Mid-Senior': [
+    "Advanced degree, professional licence, or equivalent industry certifications preferred",
+    '5–7 years of progressive experience in a closely related discipline or sector',
+    'Proven ability to lead projects end-to-end from initiation through delivery and review',
+    'Strong stakeholder management skills and executive-level communication capabilities',
+    'Demonstrated track record of developing and retaining high-performing team members',
+  ],
+  'Senior': [
+    "Bachelor's or Master's degree in a relevant technical or professional discipline",
+    '7+ years of senior-level experience with measurable leadership and business impact',
+    'Deep subject matter expertise with recognised credibility across the industry',
+    'Strategic planning capability with a record of large-scale, complex project success',
+    'Strong cross-organisational influence and executive stakeholder management skills',
+  ],
+  'Executive': [
+    "Master's degree, PhD, or equivalent elite-level professional qualification required",
+    '10+ years of executive, championship-level, or C-suite experience',
+    'Exceptional leadership record with documented, transformational organisational impact',
+    'Established professional network across regional Pokémon League and industry bodies',
+    'Outstanding public representation, media presence, and strategic communication skills',
+  ],
+};
 
 // ─── Job Detail Overlay ───────────────────────────────────────────────────────
 function JobDetailOverlay({ result, showScore, onClose }: { result: { job: Job; score: number; matched: string[] }; showScore: boolean; onClose: () => void }) {
@@ -1226,15 +1499,14 @@ function JobDetailOverlay({ result, showScore, onClose }: { result: { job: Job; 
 
             <div className="flex items-center gap-4">
               <div
-                className="w-16 h-16 rounded-xl flex items-center justify-center overflow-hidden shrink-0"
-                style={{ background: company.logoBg }}
+                className="w-16 h-16 rounded-xl flex items-center justify-center text-xl font-black shrink-0 overflow-hidden"
+                style={{ background: company.logoBg, color: company.logoText }}
               >
-                <img 
-                  src={company.logo} 
-                  alt={job.company} 
-                  className="w-full h-full object-cover"
-                  onError={(e) => { e.currentTarget.style.display = 'none'; }}
-                />
+                {typeof company.logo === 'string' && company.logo.length > 5 ? (
+                  <img src={company.logo} alt={company.logoText} className="w-full h-full object-cover" />
+                ) : (
+                  company.logo
+                )}
               </div>
               <div>
                 <h2 style={{ fontSize: '20px', fontWeight: 700, color: 'white', marginBottom: '4px' }}>{job.title}</h2>
@@ -1245,6 +1517,13 @@ function JobDetailOverlay({ result, showScore, onClose }: { result: { job: Job; 
                   <span>·</span>
                   <span style={{ fontFamily: 'DM Mono' }}>{job.salary}</span>
                 </div>
+                {job.urgent && (
+                  <div className="mt-2 inline-flex items-center gap-1.5 px-3 py-1 rounded-full"
+                    style={{ background: 'var(--red)', fontSize: '11px', fontWeight: 700, color: 'white' }}>
+                    <Icon.Lightning size={10} color="white" />
+                    Urgent Hire
+                  </div>
+                )}
               </div>
             </div>
           </div>
@@ -1260,54 +1539,8 @@ function JobDetailOverlay({ result, showScore, onClose }: { result: { job: Job; 
               </button>
             </div>
 
-            {showScore && (
-              <div className="mb-6 p-5 rounded-xl border" style={{ background: 'var(--surface-2)', borderColor: 'var(--border)' }}>
-                <div className="flex items-center justify-between mb-3">
-                  <span style={{ fontSize: '14px', fontWeight: 700, color: 'var(--t1)' }}>Match Score</span>
-                  <span
-                    className="px-3 py-1.5 rounded-lg font-bold"
-                    style={{
-                      fontFamily: 'DM Mono',
-                      fontSize: '18px',
-                      background: score >= 80 ? 'var(--green-bg)' : score >= 50 ? 'var(--amber-bg)' : 'var(--red-bg)',
-                      color: score >= 80 ? 'var(--green)' : score >= 50 ? 'var(--amber)' : 'var(--red)',
-                    }}
-                  >
-                    {score}%
-                  </span>
-                </div>
-                <div className="h-2.5 rounded-full overflow-hidden mb-4" style={{ background: 'var(--border)' }}>
-                  <div
-                    className="h-full rounded-full"
-                    style={{
-                      width: `${score}%`,
-                      background: score >= 80 ? 'var(--green)' : score >= 50 ? 'var(--amber)' : 'var(--red)',
-                    }}
-                  />
-                </div>
-                <div className="flex flex-wrap gap-1.5">
-                  {job.skills.map((skill: string, i: number) => {
-                    const isMatched = matched.includes(skill);
-                    return (
-                      <span
-                        key={i}
-                        className="px-2.5 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1"
-                        style={{
-                          background: isMatched ? 'var(--green-bg)' : 'var(--surface)',
-                          color: isMatched ? 'var(--green)' : 'var(--t3)',
-                          border: `1px solid ${isMatched ? 'var(--green)' : 'var(--border)'}`,
-                        }}
-                      >
-                        {isMatched && <Icon.Check size={9} color="var(--green)" />}
-                        {skill}
-                      </span>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-
-            <div className="mb-5 flex items-center gap-2">
+            {/* Meta */}
+            <div className="mb-5 flex items-center gap-2 flex-wrap">
               <span
                 className="px-3 py-1.5 rounded-lg text-xs font-bold"
                 style={{ background: typeInfo.bg, color: typeInfo.color }}
@@ -1317,18 +1550,145 @@ function JobDetailOverlay({ result, showScore, onClose }: { result: { job: Job; 
               <span style={{ fontSize: '12px', color: 'var(--t4)' }}>· {job.level} · Posted {job.posted}</span>
             </div>
 
-            <div className="mb-6">
-              <h3 style={{ fontSize: '14px', fontWeight: 700, color: 'var(--t1)', marginBottom: '10px' }}>
-                About {job.company}
-              </h3>
-              <p style={{ fontSize: '13px', lineHeight: 1.7, color: 'var(--t2)' }}>{company.about}</p>
+            {/* ── Skills & Keywords — always visible ── */}
+            <div className="mb-6 p-5 rounded-xl border" style={{ background: 'var(--surface-2)', borderColor: 'var(--border)' }}>
+              <div className="flex items-center gap-2 mb-4">
+                <Icon.Tag size={14} color={typeInfo.color} />
+                <h3 style={{ fontSize: '14px', fontWeight: 700, color: 'var(--t1)' }}>Skills &amp; Keywords</h3>
+              </div>
+
+              {/* Industry label */}
+              <div className="mb-3">
+                <span style={{ fontSize: '10px', fontWeight: 700, color: 'var(--t4)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                  Industry
+                </span>
+                <div className="mt-1.5">
+                  <span className="inline-flex items-center px-3 py-1 rounded-lg text-xs font-bold"
+                    style={{ background: typeInfo.bg, color: typeInfo.color, border: `1px solid ${typeInfo.barColor}33` }}>
+                    {job.type}
+                  </span>
+                </div>
+              </div>
+
+              {/* Key skills */}
+              <div>
+                <span style={{ fontSize: '10px', fontWeight: 700, color: 'var(--t4)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                  Required Skills
+                </span>
+                <div className="flex flex-wrap gap-1.5 mt-1.5">
+                  {job.skills.map((skill: string, i: number) => {
+                    const isMatched = showScore && matched.includes(skill);
+                    return (
+                      <span
+                        key={i}
+                        className="px-2.5 py-1 rounded-md text-xs font-semibold flex items-center gap-1"
+                        style={{
+                          background: isMatched ? 'var(--green-bg)' : typeInfo.bg,
+                          color: isMatched ? 'var(--green)' : typeInfo.color,
+                          border: `1px solid ${isMatched ? 'var(--green)' : typeInfo.barColor}33`,
+                        }}
+                      >
+                        {isMatched && <Icon.Check size={9} color="var(--green)" />}
+                        {skill}
+                      </span>
+                    );
+                  })}
+                </div>
+              </div>
             </div>
 
-            <div>
-              <h3 style={{ fontSize: '14px', fontWeight: 700, color: 'var(--t1)', marginBottom: '10px' }}>
-                Role Overview
-              </h3>
-              <p style={{ fontSize: '13px', lineHeight: 1.7, color: 'var(--t2)' }}>{job.desc}</p>
+            {/* Match score — only when analysis done */}
+            {showScore && (() => {
+              const ml = getMatchLabel(score);
+              return (
+                <div className="mb-6 p-5 rounded-xl border" style={{ background: 'var(--surface-2)', borderColor: 'var(--border)' }}>
+                  <div className="flex items-center justify-between mb-3">
+                    <div>
+                      <span style={{ fontSize: '14px', fontWeight: 700, color: 'var(--t1)' }}>Match Score</span>
+                      <div className="mt-1">
+                        <span
+                          className="inline-block px-2.5 py-0.5 rounded-full text-[10px] font-bold"
+                          style={{ background: ml.bg, color: ml.color }}
+                        >
+                          {ml.label}
+                        </span>
+                      </div>
+                    </div>
+                    <span
+                      className="px-3 py-1.5 rounded-lg font-bold"
+                      style={{ fontFamily: 'DM Mono', fontSize: '22px', background: ml.bg, color: ml.color }}
+                    >
+                      {score}%
+                    </span>
+                  </div>
+                  <div className="h-2.5 rounded-full overflow-hidden" style={{ background: 'var(--border)' }}>
+                    <div className="h-full rounded-full" style={{ width: `${score}%`, background: ml.color }} />
+                  </div>
+                  <p className="mt-3" style={{ fontSize: '12px', color: 'var(--t3)' }}>
+                    {matched.length} of {job.skills.length} required skills matched from your CV
+                  </p>
+                </div>
+              );
+            })()}
+
+            {/* Role Overview */}
+            <div className="mb-6 p-5 rounded-xl border" style={{ background: 'var(--surface-2)', borderColor: 'var(--border)' }}>
+              <div className="flex items-center gap-2 mb-3">
+                <Icon.Briefcase size={14} color="var(--navy)" />
+                <h3 style={{ fontSize: '14px', fontWeight: 700, color: 'var(--t1)' }}>Role Overview</h3>
+              </div>
+              <p style={{ fontSize: '13px', lineHeight: 1.75, color: 'var(--t2)' }}>{job.desc}</p>
+            </div>
+
+            {/* Key Responsibilities */}
+            <div className="mb-6 p-5 rounded-xl border" style={{ background: 'var(--surface-2)', borderColor: 'var(--border)' }}>
+              <div className="flex items-center gap-2 mb-3">
+                <Icon.List size={14} color="var(--red)" />
+                <h3 style={{ fontSize: '14px', fontWeight: 700, color: 'var(--t1)' }}>Key Responsibilities</h3>
+              </div>
+              <ul className="space-y-2.5">
+                {(TYPE_RESPONSIBILITIES[job.type] || []).map((r: string, i: number) => (
+                  <li key={i} className="flex items-start gap-2.5">
+                    <div
+                      className="mt-1.5 shrink-0 w-4 h-4 rounded-full flex items-center justify-center"
+                      style={{ background: 'var(--red-bg)' }}
+                    >
+                      <div className="w-1.5 h-1.5 rounded-full" style={{ background: 'var(--red)' }} />
+                    </div>
+                    <span style={{ fontSize: '13px', lineHeight: 1.65, color: 'var(--t2)' }}>{r}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+
+            {/* Requirements */}
+            <div className="mb-6 p-5 rounded-xl border" style={{ background: 'var(--surface-2)', borderColor: 'var(--border)' }}>
+              <div className="flex items-center gap-2 mb-3">
+                <Icon.Check size={14} color="var(--green)" />
+                <h3 style={{ fontSize: '14px', fontWeight: 700, color: 'var(--t1)' }}>Requirements</h3>
+              </div>
+              <ul className="space-y-2.5">
+                {(LEVEL_REQUIREMENTS[job.level] || LEVEL_REQUIREMENTS['Mid']).map((req: string, i: number) => (
+                  <li key={i} className="flex items-start gap-2.5">
+                    <div
+                      className="mt-1 shrink-0 w-4 h-4 rounded-full flex items-center justify-center"
+                      style={{ background: 'var(--green-bg)' }}
+                    >
+                      <Icon.Check size={9} color="var(--green)" />
+                    </div>
+                    <span style={{ fontSize: '13px', lineHeight: 1.65, color: 'var(--t2)' }}>{req}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+
+            {/* About Company */}
+            <div className="mb-6 p-5 rounded-xl border" style={{ background: 'var(--surface-2)', borderColor: 'var(--border)' }}>
+              <div className="flex items-center gap-2 mb-3">
+                <Icon.Building size={14} color="var(--t3)" />
+                <h3 style={{ fontSize: '14px', fontWeight: 700, color: 'var(--t1)' }}>About {job.company}</h3>
+              </div>
+              <p style={{ fontSize: '13px', lineHeight: 1.75, color: 'var(--t2)' }}>{company.about}</p>
             </div>
           </div>
         </div>
@@ -1338,13 +1698,21 @@ function JobDetailOverlay({ result, showScore, onClose }: { result: { job: Job; 
 }
 
 // ─── Companies View ───────────────────────────────────────────────────────────
-function CompaniesView() {
+function CompaniesView({ onBrowseCompany }: { onBrowseCompany: (company: string) => void }) {
+  const [previewCompany, setPreviewCompany] = useState<string | null>(null);
+
+  const previewData = previewCompany ? {
+    company: COMPANIES[previewCompany],
+    jobs: JOBS.filter((j) => j.company === previewCompany),
+    totalOpenings: JOBS.filter((j) => j.company === previewCompany).reduce((sum, j) => sum + j.openings, 0),
+  } : null;
+
   return (
     <div className="max-w-[1400px] mx-auto px-8 py-10">
       <div className="mb-8">
         <h1 style={{ fontSize: '34px', fontWeight: 800, color: 'var(--t1)', marginBottom: '6px' }}>Partner Companies</h1>
         <p style={{ fontSize: '15px', color: 'var(--t3)' }}>
-          {UNIQUE_COMPANIES} leading organisations hiring through DexMatch
+          {UNIQUE_COMPANIES} leading organisations hiring through DexMatch — click any card to preview open roles
         </p>
       </div>
 
@@ -1352,21 +1720,21 @@ function CompaniesView() {
         {Object.entries(COMPANIES).map(([name, company]) => {
           const jobCount = JOBS.filter((j) => j.company === name).reduce((sum, j) => sum + j.openings, 0);
           return (
-            <div
+            <button
               key={name}
-              className="p-5 rounded-xl border transition-all hover:shadow-lg"
+              onClick={() => setPreviewCompany(name)}
+              className="p-5 rounded-xl border transition-all hover:shadow-lg text-left w-full"
               style={{ background: 'var(--surface)', borderColor: 'var(--border)' }}
             >
               <div
-                className="w-14 h-14 rounded-xl flex items-center justify-center overflow-hidden shrink-0 mb-3"
-                style={{ background: company.logoBg }}
+                className="w-14 h-14 rounded-xl flex items-center justify-center text-base font-black mb-3 shrink-0 overflow-hidden"
+                style={{ background: company.logoBg, color: company.logoText }}
               >
-                <img 
-                  src={company.logo} 
-                  alt={name} 
-                  className="w-full h-full object-cover"
-                  onError={(e) => { e.currentTarget.style.display = 'none'; }}
-                />
+                {typeof company.logo === 'string' && company.logo.length > 5 ? (
+                  <ImageWithFallback src={company.logo} alt={company.logoText} className="w-full h-full object-cover" />
+                ) : (
+                  company.logo
+                )}
               </div>
               <h3 style={{ fontSize: '13px', fontWeight: 700, color: 'var(--t1)', marginBottom: '4px' }}>{name}</h3>
               <p style={{ fontSize: '11px', color: 'var(--t3)', marginBottom: '12px', minHeight: '30px', lineHeight: 1.5 }}>
@@ -1381,10 +1749,149 @@ function CompaniesView() {
                   {jobCount} {jobCount === 1 ? 'opening' : 'openings'}
                 </span>
               </div>
-            </div>
+              {/* Preview cue */}
+              <div className="mt-3 flex items-center gap-1" style={{ fontSize: '10px', color: 'var(--red)', fontWeight: 600 }}>
+                <Icon.Search size={10} color="var(--red)" />
+                View open roles
+              </div>
+            </button>
           );
         })}
       </div>
+
+      {/* Company Preview Modal */}
+      {previewCompany && previewData && (
+        <div
+          className="fixed inset-0 z-50 overflow-y-auto"
+          style={{ background: 'rgba(0,0,0,0.55)', animation: 'fadeIn 0.2s ease' }}
+          onClick={() => setPreviewCompany(null)}
+        >
+          <div className="min-h-screen px-4 py-12 flex items-start justify-center">
+            <div
+              className="w-full max-w-[680px] rounded-2xl overflow-hidden"
+              style={{ background: 'var(--surface)', boxShadow: 'var(--s4)', animation: 'slideDown 0.3s ease' }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              {/* Modal header — company banner */}
+              <div
+                className="p-6 border-b relative"
+                style={{ background: previewData.company.bannerBg, borderColor: 'var(--border)' }}
+              >
+                <button
+                  onClick={() => setPreviewCompany(null)}
+                  className="absolute right-5 top-5 w-9 h-9 rounded-full flex items-center justify-center"
+                  style={{ background: 'rgba(255,255,255,0.12)' }}
+                >
+                  <Icon.Close size={15} color="white" />
+                </button>
+                <div className="flex items-center gap-4">
+                  <div
+                    className="w-16 h-16 rounded-xl flex items-center justify-center text-xl font-black shrink-0 overflow-hidden"
+                    style={{ background: previewData.company.logoBg, color: previewData.company.logoText }}
+                  >
+                    {typeof previewData.company.logo === 'string' && previewData.company.logo.length > 5 ? (
+                      <img src={previewData.company.logo} alt={previewData.company.logoText} className="w-full h-full object-cover" />
+                    ) : (
+                      previewData.company.logo
+                    )}
+                  </div>
+                  <div>
+                    <h2 style={{ fontSize: '20px', fontWeight: 800, color: 'white', marginBottom: '3px' }}>{previewCompany}</h2>
+                    <div style={{ fontSize: '13px', color: 'rgba(255,255,255,0.7)' }}>{previewData.company.industry}</div>
+                    <div style={{ fontSize: '12px', color: 'rgba(255,255,255,0.55)', marginTop: '2px' }}>{previewData.company.tagline}</div>
+                  </div>
+                </div>
+              </div>
+
+              {/* About */}
+              <div className="px-6 pt-5 pb-2">
+                <p style={{ fontSize: '13px', lineHeight: 1.7, color: 'var(--t3)' }}>{previewData.company.about}</p>
+              </div>
+
+              {/* Job listing preview */}
+              <div className="px-6 pb-4">
+                <div className="flex items-center justify-between mb-3 mt-4">
+                  <span style={{ fontSize: '13px', fontWeight: 700, color: 'var(--t1)' }}>
+                    Open Roles
+                  </span>
+                  <span
+                    className="px-2.5 py-1 rounded-full text-[10px] font-bold"
+                    style={{ background: 'var(--green-bg)', color: 'var(--green)' }}
+                  >
+                    {previewData.totalOpenings} {previewData.totalOpenings === 1 ? 'opening' : 'openings'}
+                  </span>
+                </div>
+
+                <div className="space-y-2 max-h-[320px] overflow-y-auto pr-1">
+                  {previewData.jobs.map((job) => {
+                    const typeInfo = JOB_TYPES[job.type as JobType];
+                    return (
+                      <div
+                        key={job.id}
+                        className="flex items-center justify-between px-4 py-3 rounded-xl border"
+                        style={{ background: 'var(--surface-2)', borderColor: 'var(--border)', borderLeft: `3px solid ${typeInfo.barColor}` }}
+                      >
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2 mb-0.5">
+                            <span style={{ fontSize: '13px', fontWeight: 700, color: 'var(--t1)' }} className="truncate">
+                              {job.title}
+                            </span>
+                            {job.urgent && (
+                              <span
+                                className="shrink-0 flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold"
+                                style={{ background: 'var(--red)', color: 'white' }}
+                              >
+                                <Icon.Lightning size={8} color="white" />
+                                Urgent
+                              </span>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <span
+                              className="inline-flex px-1.5 py-0.5 rounded text-[9px] font-bold"
+                              style={{ background: typeInfo.bg, color: typeInfo.color }}
+                            >
+                              {job.type}
+                            </span>
+                            <span style={{ fontSize: '10px', color: 'var(--t4)' }}>{job.level} · {job.region}</span>
+                          </div>
+                        </div>
+                        <div className="ml-3 shrink-0 text-right">
+                          <div style={{ fontFamily: 'DM Mono', fontSize: '11px', fontWeight: 700, color: 'var(--t1)' }}>
+                            {job.salary}
+                          </div>
+                          <div style={{ fontSize: '9px', color: 'var(--t4)', marginTop: '2px' }}>
+                            {job.openings} {job.openings === 1 ? 'opening' : 'openings'}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* CTA Footer */}
+              <div className="px-6 pb-6 pt-2 flex gap-3">
+                <button
+                  onClick={() => { setPreviewCompany(null); onBrowseCompany(previewCompany); }}
+                  className="flex-1 h-11 rounded-xl font-bold flex items-center justify-center gap-2 transition-all hover:shadow-md"
+                  style={{ background: 'var(--red)', color: 'white', fontSize: '14px' }}
+                >
+                  <Icon.Briefcase size={15} color="white" />
+                  Browse All Jobs from {previewCompany}
+                </button>
+                <button
+                  onClick={() => setPreviewCompany(null)}
+                  className="px-5 h-11 rounded-xl border font-semibold"
+                  style={{ borderColor: 'var(--border)', color: 'var(--t2)', fontSize: '13px' }}
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

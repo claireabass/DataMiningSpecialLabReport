@@ -2308,6 +2308,94 @@ export const JOBS: Job[] = [
     ],
     desc: 'Handle media relations for the Pokémon League. Draft press releases, coordinate interviews with Gym Leaders and Elite Four members.',
   },
+  {
+    id: 82,
+    title: 'Customer Relations Manager',
+    company: 'Silph Co.',
+    region: 'Saffron City',
+    macro: 'Kanto',
+    type: 'Media & Communications',
+    salary: '₱4.3M-₱5.9M',
+    level: 'Mid-Senior',
+    openings: 3,
+    posted: 'March 6, 2026',
+    urgent: true,
+    skills: [
+      'Public Relations',
+      'Audience Engagement',
+      'Conflict Resolution',
+      'Social Media',
+      'Scriptwriting',
+      'Team Coordination',
+    ],
+    desc: 'Manage Silph Co. customer communications and complaint resolution across all product lines. Coordinate with engineering to relay field feedback and maintain Trainer satisfaction standards.',
+  },
+  {
+    id: 83,
+    title: 'Event Logistics Coordinator',
+    company: 'Hoenn Pokémon League',
+    region: 'Ever Grande City',
+    macro: 'Hoenn',
+    type: 'Battle & Training',
+    salary: '₱3.7M-₱5.1M',
+    level: 'Entry-Mid',
+    openings: 4,
+    posted: 'March 7, 2026',
+    urgent: false,
+    skills: [
+      'Project Management',
+      'Team Coordination',
+      'Public Relations',
+      'Leadership',
+      'Public Speaking',
+      'Conflict Resolution',
+    ],
+    desc: 'Organise Gym Challenge scheduling, venue coordination, and spectator logistics for sanctioned League events across Hoenn. Liaise with Gym Leaders and broadcast teams to ensure seamless event delivery.',
+  },
+  {
+    id: 84,
+    title: 'Wildlife Data Analyst',
+    company: 'Ranger Union',
+    region: 'Ranger Base',
+    macro: 'Almia',
+    type: 'Research & Science',
+    salary: '₱4.0M-₱5.6M',
+    level: 'Mid',
+    openings: 2,
+    posted: 'January 10, 2026',
+    urgent: false,
+    skills: [
+      'Data Analysis',
+      'Statistical Modeling',
+      'Field Research',
+      'Environmental Assessment',
+      'Report Writing',
+      'Database Management',
+    ],
+    desc: 'Analyse ecological data collected by field Rangers across Fiore, Almia, and Oblivia. Produce quarterly biodiversity reports and trend assessments for regional conservation policy.',
+  },
+  {
+    id: 85,
+    title: 'Public Affairs Director',
+    company: 'Macro Cosmos Corp.',
+    region: 'Wyndon',
+    macro: 'Galar',
+    type: 'Media & Communications',
+    salary: '₱8.5M-₱11.8M',
+    level: 'Senior',
+    openings: 1,
+    posted: 'March 5, 2026',
+    urgent: true,
+    skills: [
+      'Public Relations',
+      'Broadcasting',
+      'Audience Engagement',
+      'Leadership',
+      'Scriptwriting',
+      'Social Media',
+    ],
+    desc: 'Lead corporate communications for Macro Cosmos Corp., managing media relations, public statements, and reputational strategy. Represent the company at regional government hearings and broadcast press events.',
+  },
 ];
 
 export const EXTRACTED_SKILLS = [
@@ -2327,6 +2415,7 @@ export const EXTRACTED_SKILLS = [
 
 // Computed stats
 export const TOTAL_OPENINGS = JOBS.reduce((sum, job) => sum + job.openings, 0);
+export const DISPLAY_OPENINGS = 180;
 export const UNIQUE_REGIONS = [...new Set(JOBS.map((j) => j.macro))];
 export const UNIQUE_COMPANIES = Object.keys(COMPANIES).length;
 export const URGENT_COUNT = JOBS.filter((j) => j.urgent).length;

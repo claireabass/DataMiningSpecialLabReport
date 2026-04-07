@@ -35,22 +35,34 @@ The frontend will be available at: **[http://localhost:5173](http://localhost:51
 ### 3. Backend Setup (FastAPI + ML Engine)
 Open a **new** terminal in the project root:
 
-#### A. Install Python Dependencies
+#### A. Create a Virtual Environment (Recommended)
+This isolates the project dependencies and prevents version conflicts.
+```bash
+# Windows
+python -m venv venv
+.\venv\Scripts\activate
+
+# Mac/Linux
+python3 -m venv venv
+source venv/bin/activate
+```
+
+#### B. Install Python Dependencies
 ```bash
 # Install the required libraries from requirements.txt
 pip install -r requirements.txt
 ```
 
-#### B. Download the NLP Model
+#### C. Download the NLP Model
 The resume matcher uses SpaCy's medium-sized semantic model for synonym matching:
 ```bash
 python -m spacy download en_core_web_md
 ```
 
-#### C. Run the Backend API
+#### D. Run the Backend API
 ```bash
 # Start the FastAPI server using Uvicorn
-python -m uvicorn main:app --reload
+python -m uvicorn main:app --reload --port 8000
 ```
 The ML backend will be active at: **[http://localhost:8000](http://localhost:8000)**
 
